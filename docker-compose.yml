@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:latest
+    container_name: redis
+    restart: always
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", ""]
+    networks:
+      - my_network
+
+#  scraper:
+#    build:
+#      context: ./pricestream
+#      dockerfile: Dockerfile
+#    image: ghcr.io/yasir-khalid/tradovate-price-scraper:latest
+#    platform: linux/amd64
+#    container_name: scraper
+#    restart: always
+#    depends_on:
+#      - redis
+#    env_file:
+#      - .env
+#    networks:
+#      - my_network
+
+networks:
+  my_network:
+    driver: bridge
