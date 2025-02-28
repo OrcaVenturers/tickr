@@ -9,7 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the entire application into the container
-COPY . .
+COPY tickr .
 
 CMD ["python", "-m", "strategies.fibonnaci.retracement"]
 

@@ -1,6 +1,0 @@
-loguru==0.7.2
-Requests==2.32.3
-rich==13.9.4
-tenacity==8.5.0
-pandas==2.2.3
-redis
