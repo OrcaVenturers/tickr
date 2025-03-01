@@ -10,8 +10,8 @@ from typing import List, Optional
 import redis
 import json
 from termcolor import colored, cprint
-from tickr.strategies.fibonacci.backgroundWorkerNotifications import *
-from tickr.strategies.fibonacci.config import FIBONACCI_RATIOS, CandlestickComputationTime, isWithinAllowableTradingWindow, CandlestickKickoffPoints, TradeExecutionSettings
+from tickr.strategies.fibonacci.discord import *
+from tickr.strategies.fibonacci.config import settings
 from tickr.strategies.fibonacci.schemas import PendingOrder, PositionClose, PositionOpen
 from tickr.strategies.fibonacci.reporting import print_position_close_table, print_position_summary_table
 from loguru import logger
@@ -26,7 +26,7 @@ app = typer.Typer()
 def calculate_fib_levels(point_a, point_b):
     # Calculate the difference between Point A and Point B
     difference = point_a - point_b
-    ratios = FIBONACCI_RATIOS
+    ratios = settings.FIBONACCI_RATIOS
 
     # Calculate the levels for each ratio
     fib_levels = {}
@@ -60,12 +60,12 @@ class FibonacciTradingBot:
         self.POINT_A = float('-inf')
         self.POINT_B = float('inf')
         self.fib_levels = None
-        self.TP = 15.0 if TradeExecutionSettings.takeProfit.value is None else TradeExecutionSettings.takeProfit.value
-        self.SL = 15.0 if TradeExecutionSettings.stopLoss.value is None else TradeExecutionSettings.stopLoss.value
-        self.REACTIVATION_DISTANCE = 30.0 if TradeExecutionSettings.reactivationDistance.value is None else TradeExecutionSettings.reactivationDistance.value
+        self.TP = settings.TradeExecutionSettings.takeProfit
+        self.SL = settings.TradeExecutionSettings.stopLoss
+        self.REACTIVATION_DISTANCE = settings.TradeExecutionSettings.reactivationDistance
         self.precalculations = True
         self.isTradingZoneActive = True
-        self.client: Optional[RedisCluster] = None
+        self.client: Optional[RedisCluster] = get_redis_client()
 
         self.active_levels = None
         self.last_price = None
@@ -90,6 +90,7 @@ class FibonacciTradingBot:
                 positionTakeProfit = price - self.TP  # Take Profit
                 positionStopLoss = price + self.SL  # Stop Loss
             open_position = PositionOpen(
+                    instrument = settings.INSTRUMENT,
                     fibRatioLevel = level,
                     positionType = order_type,
                     positionEntryPrice = price,
@@ -112,6 +113,7 @@ class FibonacciTradingBot:
             takeProfit = fib_level_price - self.TP
             stopLoss = fib_level_price + self.SL
         pendingOrderGenerated = PendingOrder(
+                instrument = settings.INSTRUMENT,
                 orderType=order_type,
                 price=fib_level_price,
                 fibRatioLevel=fib_level,
@@ -123,17 +125,26 @@ class FibonacciTradingBot:
         self.pending_orders.append(
             pendingOrderGenerated
         )
-        send_notification(self.client, "PENDING_ORDER", notification=pendingOrderGenerated.model_dump())
-        # asyncio.run(
-        #     send_discord_message(
-        #         generate_order_discord_embed(pendingOrderGenerated)
-        #     )
-        # )
-
+        send_notification(
+            self.client,
+            stream=settings.ORDERS_NOTIFICATIONS_STREAM,
+            event = "PENDING_ORDER",
+            notification = {
+                "metadata": pendingOrderGenerated.model_dump(),
+                "Instrument": settings.INSTRUMENT,
+                "AtmStrategy": f"{self.TP}_{self.SL}"
+            }
+        )
+        send_notification(
+            self.client,
+            stream=settings.DISCORD_NOTIFICATIONS_STREAM,
+            event = "PENDING_ORDER",
+            notification=pendingOrderGenerated.model_dump()
+        )
 
     def precalculations_phase(self, current_price, tick_timestamp) -> bool:
-        start_time = CandlestickComputationTime.start.value
-        end_time = CandlestickComputationTime.end.value
+        start_time = settings.CandlestickComputationTime.start
+        end_time = settings.CandlestickComputationTime.end
 
         def printFibonnaciLevels(fib_levels):
             table_data = [[key, value] for key, value in fib_levels.items()]
@@ -146,11 +157,9 @@ class FibonacciTradingBot:
             self.POINT_B = min(self.POINT_B, current_price)
             return self.precalculations
         elif tick_timestamp.time() > end_time:
-            # TODO: Manual override of starting points
-            self.POINT_A = self.POINT_A if CandlestickKickoffPoints.POINT_A.value is None else CandlestickKickoffPoints.POINT_A.value
-            self.POINT_B = self.POINT_B if CandlestickKickoffPoints.POINT_B.value is None else CandlestickKickoffPoints.POINT_B.value
-
             self.precalculations = False
+            self.POINT_A = self.POINT_A if settings.CandlestickKickoffPoints.POINT_A is None else settings.CandlestickKickoffPoints.POINT_A
+            self.POINT_B = self.POINT_B if settings.CandlestickKickoffPoints.POINT_B is None else settings.CandlestickKickoffPoints.POINT_B
             self.fib_levels = calculate_fib_levels(
                 point_a=self.POINT_A,
                 point_b=self.POINT_B
@@ -158,6 +167,17 @@ class FibonacciTradingBot:
             self.active_levels = {level: False for level in self.fib_levels}
             print(f"POINT A: {self.POINT_A}, POINT B: {self.POINT_B}")
             printFibonnaciLevels(self.fib_levels)
+            send_notification(
+                self.client,
+                stream=settings.DISCORD_NOTIFICATIONS_STREAM,
+                event="KICKOFF",
+                notification= {
+                    "POINT_A": self.POINT_A,
+                    "POINT_B": self.POINT_B,
+                    "INSTRUMENT": settings.INSTRUMENT,
+                    "FIBONACCI": self.fib_levels
+                }
+            )
             return self.precalculations
         else: # If price is before 2.30pm (ignore)
             self.precalculations = True
@@ -165,7 +185,7 @@ class FibonacciTradingBot:
 
     # @timeit
     def process_price(self, current_price, tick_timestamp: datetime):
-        self.isTradingZoneActive: bool = isWithinAllowableTradingWindow(tick_timestamp)
+        self.isTradingZoneActive: bool = settings.isWithinAllowableTradingWindow(tick_timestamp)
         if self.precalculations:
             self.precalculations_phase(current_price, tick_timestamp)
             return
@@ -209,13 +229,13 @@ class FibonacciTradingBot:
             self.closed_positions.append(closed_position)
             highlighted_message_color = "on_green" if closed_position.outcome == "PROFIT" else "on_red"
             cprint(f"{tick_timestamp}: Position closed/flatten at {current_price} - {result}: {profit_loss}", "black", highlighted_message_color)
-            # asyncio.run(
-            #     send_discord_message(
-            #         generate_position_closed_discord_embed(closed_position)
-            #     )
-            # )
             print(closed_position)
-            send_notification(self.client, "POSITION_CLOSE", notification=closed_position.model_dump())
+            send_notification(
+                self.client,
+                stream=settings.DISCORD_NOTIFICATIONS_STREAM,
+                event="POSITION_CLOSE",
+                notification=closed_position.model_dump()
+            )
 
     def reactivate_levels(self, current_price, tick_timestamp):
         for fib_level, fib_level_price in self.fib_levels.items():
@@ -231,9 +251,8 @@ class FibonacciTradingBot:
 
 
     def production(self):
-        self.client = get_redis_client()
         pubsub = self.client.pubsub()
-        pubsub.subscribe("NT8_NQ_PRICESTREAM")  # Listen to the channel
+        pubsub.subscribe(settings.REDIS_PRICE_STREAM_CHANNEL)  # Listen to the channel
         # Flag to control the loop
         running = True
         logger.info("Listening for price stream...")
@@ -275,11 +294,10 @@ class FibonacciTradingBot:
 
 
 @app.command()
-def production(pricestream: Optional[str] = None):
-    if not pricestream:
-        logger.error("No REDIS pricestream defined? Please define using --pricestream flag")
-    else:
-        typer.echo(f"Connecting to REDIS stream: {pricestream}")
+def production():
+    print(settings.model_dump())
+    bot = FibonacciTradingBot()
+    bot.production()
 
 
 @app.command()
@@ -294,10 +312,3 @@ def backtest(filepath: Optional[str] = None):
 
 if __name__ == "__main__":
     app()
-# if __name__ == "__main__":
-#     DISCORD_NOTIFICATIONS: bool = True
-#     REDIS_NOTIFICATIONS_STREAM: str = "DISCORD_NOTIFICATIONS_STREAM"
-#     REDIS_PRICE_STREAM_CHANNEL: str = "NT8_NQ_PRICESTREAM"
-#     bot = FibonacciTradingBot()
-#     bot.backtest("datasets/NQ 27-02-2025.Last/NQ 27-02-2025.Last.txt")
-#     # bot.production()

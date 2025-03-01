@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from tabulate import tabulate
 
 class PendingOrder(BaseModel):
+    instrument: str
     orderType: str
     price: float
     fibRatioLevel: float
@@ -14,6 +15,7 @@ class PendingOrder(BaseModel):
 
 
 class PositionOpen(BaseModel):
+    instrument: str
     fibRatioLevel: float
     positionType: str
     positionEntryPrice: float

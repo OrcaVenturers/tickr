@@ -8,15 +8,11 @@ from redis import Redis
 from redis.cluster import RedisCluster
 import tickr
 import json
-from tickr.strategies.fibonacci import config
+from tickr.strategies.fibonacci.config import settings
 
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")  # Default to "redis"
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
-
-if not all([REDIS_HOST, REDIS_PORT, REDIS_PASSWORD]):
-    raise ValueError("Missing required environment variables!")
-
+REDIS_HOST = settings.CONNECTIONS.REDIS_HOST
+REDIS_PORT = settings.CONNECTIONS.REDIS_PORT
+REDIS_PASSWORD = settings.CONNECTIONS.REDIS_PASSWORD
 
 running = True
 def signal_handler(sig, frame):
@@ -42,13 +38,13 @@ def get_redis_client() -> Optional[RedisCluster]:
         return None
 
 
-def send_notification(client: RedisCluster, event: str, notification: dict):
+def send_notification(client: RedisCluster, stream: str, event: str, notification: dict):
     _message = {
         "EVENT": event,
         "MESSAGE": json.dumps(notification)
     }
-    if config.DISCORD_NOTIFICATIONS is True:
-        client.xadd(config.REDIS_NOTIFICATIONS_STREAM, _message, maxlen=1000)  # Keeps last 1000 messages
+    if settings.DISCORD_NOTIFICATIONS is True:
+        client.xadd(stream, _message, maxlen=1000)  # Keeps last 1000 messages
     else:
         logger.warning("Discord notifications off - skipping")
 
@@ -56,10 +52,10 @@ def send_notification(client: RedisCluster, event: str, notification: dict):
 if __name__ == "__main__":
     RedisClient: Optional[RedisCluster] = get_redis_client()
     pubsub = RedisClient.pubsub()
-    pubsub.subscribe(config.REDIS_PRICE_STREAM_CHANNEL)  # Listen to the channel
+    pubsub.subscribe(settings.REDIS_PRICE_STREAM_CHANNEL)  # Listen to the channel
     # Flag to control the loop
     signal.signal(signal.SIGINT, signal_handler)
-    logger.info(f"Starting to listen for price stream channel: {config.REDIS_PRICE_STREAM_CHANNEL} ...")
+    logger.info(f"Starting to listen for price stream channel: {settings.REDIS_PRICE_STREAM_CHANNEL} ...")
     try:
         while running:
             message = pubsub.get_message(timeout=1)  # Use get_message with a timeout

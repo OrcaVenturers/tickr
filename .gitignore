@@ -15,6 +15,7 @@ experimental/
 
 # ignore credentials files/or environment variables
 credentials/
+tickr/configs
 *.logs
 secrets.toml
 
@@ -26,5 +27,6 @@ secrets.toml
 !.env.vault
 *.db
 datasets
+backtests/
 trades
 transformations
