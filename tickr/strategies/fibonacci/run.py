@@ -311,4 +311,25 @@ def backtest(filepath: Optional[str] = None):
 
 
 if __name__ == "__main__":
-    app()
+    # app()
+    pendingOrderGenerated = PendingOrder(
+        instrument=settings.INSTRUMENT,
+        orderType="SELL",
+        price=5990,
+        fibRatioLevel=1.0,
+        takeProfit=21070,
+        stopLoss=21070,
+        generatedAt=str(datetime.now()),
+        systemTimeStamp=str(datetime.now()),
+    )
+
+    send_notification(
+        get_redis_client(),
+        stream=settings.ORDERS_NOTIFICATIONS_STREAM,
+        event="PENDING_ORDER",
+        notification={
+            "metadata": pendingOrderGenerated.model_dump(),
+            "Instrument": settings.INSTRUMENT,
+            "AtmStrategy": f"4_10"
+        }
+    )
