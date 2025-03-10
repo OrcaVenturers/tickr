@@ -15,7 +15,8 @@ experimental/
 
 # ignore credentials files/or environment variables
 credentials/
-tickr/configs
+configs/
+tickr/visualise/
 *.logs
 secrets.toml
 
@@ -30,3 +31,9 @@ datasets
 backtests/
 trades
 transformations
+*.log
+*.log.*
+*.log.*.*
+*.log.*.*.*
+*.log.*.*.*.*
+*.log.*.*.*.*.**.log.*.*.*.*.*.*

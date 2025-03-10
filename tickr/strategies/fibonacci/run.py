@@ -10,6 +10,7 @@ from typing import List, Optional
 import redis
 import json
 from termcolor import colored, cprint
+
 from tickr.strategies.fibonacci.discord import *
 from tickr.strategies.fibonacci.config import settings
 from tickr.strategies.fibonacci.schemas import PendingOrder, PositionClose, PositionOpen
@@ -19,8 +20,21 @@ from tickr.strategies.RedisClient import get_redis_client, send_notification
 from tabulate import tabulate
 from tickr.strategies.utils import timeit
 import typer
+from enum import Enum
+from tickr.core.constants import OrderTypes
+from tickr.external.sql.engine import engine
+from tickr.external.sql.crud import add_order, Orders, ConsumerTracking, create_or_update_order
+import uuid
+
 
 app = typer.Typer()
+
+
+def generate_hash_id(*fields: str) -> str:
+    data = "|".join(fields)  # Combine fields with a delimiter
+    hash_obj = hashlib.sha256(data.encode())  # Hash using SHA-256
+    hash_digest = base64.urlsafe_b64encode(hash_obj.digest()).decode()[:10]  # Shorten & make URL-friendly
+    return hash_digest
 
 
 def calculate_fib_levels(point_a, point_b):
@@ -65,6 +79,7 @@ class FibonacciTradingBot:
         self.REACTIVATION_DISTANCE = settings.TradeExecutionSettings.reactivationDistance
         self.precalculations = True
         self.isTradingZoneActive = True
+        self.strategyId = None
         self.client: Optional[RedisCluster] = get_redis_client()
 
         self.active_levels = None
@@ -77,11 +92,27 @@ class FibonacciTradingBot:
 
     def enter_position(self, level, order_type, price, tick_timestamp):
         self.active_levels[level] = False
+        create_or_update_order(
+            engine=engine,
+            order=Orders(
+                orderId=str(uuid.uuid4()),
+                strategyId=self.strategyId,
+                instrument=settings.INSTRUMENT,
+                orderType=order_type,
+                price=price,
+                reactivationDistance=self.REACTIVATION_DISTANCE,
+                pointA=self.POINT_A,
+                pointB=self.POINT_B,
+                fibonacciLevel=level,
+                isActive=False,
+                lastUpdatedAt=datetime.utcnow()
+            )
+        )
         logger.warning(f"{tick_timestamp}: Deactivated ratio. {level} until (`price > {price + self.REACTIVATION_DISTANCE}` OR `price < {price - self.REACTIVATION_DISTANCE}`)")
         reactivation_upper = price + self.REACTIVATION_DISTANCE
         reactivation_lower = price - self.REACTIVATION_DISTANCE
 
-        if self.isTradingZoneActive:
+        if self.isTradingZoneActive: # Only useful for backtesting / Open positions outside trading zones aren't closed
             logger.success(f"{tick_timestamp}: Entering {order_type} position at ratio:{level} - Price:{price}")
             if order_type == "LONG":
                 positionTakeProfit = price + self.TP
@@ -106,10 +137,10 @@ class FibonacciTradingBot:
 
     def generate_pending_orders(self, order_type, fib_level, fib_level_price, tick_timestamp):
         logger.info(f"{tick_timestamp}: Placed Limit Pending Order: {order_type} at price: {fib_level_price}")
-        if order_type == "BUY":
+        if order_type == OrderTypes.BUY.value:
             takeProfit = fib_level_price + self.TP
             stopLoss = fib_level_price - self.SL
-        elif order_type == "SELL":
+        elif order_type == OrderTypes.SELL.value:
             takeProfit = fib_level_price - self.TP
             stopLoss = fib_level_price + self.SL
         pendingOrderGenerated = PendingOrder(
@@ -125,22 +156,28 @@ class FibonacciTradingBot:
         self.pending_orders.append(
             pendingOrderGenerated
         )
-        send_notification(
-            self.client,
-            stream=settings.ORDERS_NOTIFICATIONS_STREAM,
-            event = "PENDING_ORDER",
-            notification = {
-                "metadata": pendingOrderGenerated.model_dump(),
-                "Instrument": settings.INSTRUMENT,
-                "AtmStrategy": f"{self.TP}_{self.SL}"
-            }
+        create_or_update_order(
+            engine = engine,
+            order = Orders(
+                orderId = str(uuid.uuid4()),
+                strategyId = self.strategyId,
+                instrument = settings.INSTRUMENT,
+                orderType=order_type,
+                price=fib_level_price,
+                reactivationDistance=self.REACTIVATION_DISTANCE,
+                pointA=self.POINT_A,
+                pointB=self.POINT_B,
+                fibonacciLevel = fib_level,
+                isActive=True,
+                lastUpdatedAt = datetime.utcnow()
+            )
         )
-        send_notification(
-            self.client,
-            stream=settings.DISCORD_NOTIFICATIONS_STREAM,
-            event = "PENDING_ORDER",
-            notification=pendingOrderGenerated.model_dump()
-        )
+        # send_notification(
+        #     self.client,
+        #     stream=settings.DISCORD_NOTIFICATIONS_STREAM,
+        #     event = "PENDING_ORDER",
+        #     notification=pendingOrderGenerated.model_dump()
+        # )
 
     def precalculations_phase(self, current_price, tick_timestamp) -> bool:
         start_time = settings.CandlestickComputationTime.start
@@ -178,6 +215,8 @@ class FibonacciTradingBot:
                     "FIBONACCI": self.fib_levels
                 }
             )
+            self.strategyId: str = f"{settings.INSTRUMENT}-{self.POINT_A}-{self.POINT_B}-{self.REACTIVATION_DISTANCE}"
+            print(f"STRATEGY ID: {self.strategyId}")
             return self.precalculations
         else: # If price is before 2.30pm (ignore)
             self.precalculations = True
@@ -216,26 +255,25 @@ class FibonacciTradingBot:
         self.last_price = current_price
 
     def close_position(self, position, result, profit_loss, current_price, tick_timestamp):
-        if self.isTradingZoneActive:
-            self.open_positions.remove(position)
-            closed_position = PositionClose(
-                                metadata=position,
-                                positionClosingPrice=current_price,
-                                positionClosingTime= str(tick_timestamp),
-                                systemTimeStamp = str(datetime.now()),
-                                outcome=result,
-                                net=profit_loss
-                            )
-            self.closed_positions.append(closed_position)
-            highlighted_message_color = "on_green" if closed_position.outcome == "PROFIT" else "on_red"
-            cprint(f"{tick_timestamp}: Position closed/flatten at {current_price} - {result}: {profit_loss}", "black", highlighted_message_color)
-            print(closed_position)
-            send_notification(
-                self.client,
-                stream=settings.DISCORD_NOTIFICATIONS_STREAM,
-                event="POSITION_CLOSE",
-                notification=closed_position.model_dump()
-            )
+        self.open_positions.remove(position)
+        closed_position = PositionClose(
+                            metadata=position,
+                            positionClosingPrice=current_price,
+                            positionClosingTime= str(tick_timestamp),
+                            systemTimeStamp = str(datetime.now()),
+                            outcome=result,
+                            net=profit_loss
+                        )
+        self.closed_positions.append(closed_position)
+        highlighted_message_color = "on_green" if closed_position.outcome == "PROFIT" else "on_red"
+        cprint(f"{tick_timestamp}: Position closed/flatten at {current_price} - {result}: {profit_loss}", "black", highlighted_message_color)
+        print(closed_position)
+        send_notification(
+            self.client,
+            stream=settings.DISCORD_NOTIFICATIONS_STREAM,
+            event="POSITION_CLOSE",
+            notification=closed_position.model_dump()
+        )
 
     def reactivate_levels(self, current_price, tick_timestamp):
         for fib_level, fib_level_price in self.fib_levels.items():
@@ -244,10 +282,8 @@ class FibonacciTradingBot:
                     self.active_levels[fib_level] = True
                     logger.info(
                         f"{tick_timestamp}: Reactivated Fib. ratio: {fib_level} ({fib_level_price}) at - current price: {current_price}")
-
-                    if self.isTradingZoneActive:
-                        pending_order_type = "SELL" if fib_level_price > current_price else "BUY"  # bouncing ball
-                        self.generate_pending_orders(pending_order_type, fib_level, fib_level_price, tick_timestamp)
+                    pending_order_type = OrderTypes.SELL.value if fib_level_price > current_price else OrderTypes.BUY.value  # bouncing ball
+                    self.generate_pending_orders(pending_order_type, fib_level, fib_level_price, tick_timestamp)
 
 
     def production(self):
@@ -311,25 +347,25 @@ def backtest(filepath: Optional[str] = None):
 
 
 if __name__ == "__main__":
-    # app()
-    pendingOrderGenerated = PendingOrder(
-        instrument=settings.INSTRUMENT,
-        orderType="SELL",
-        price=5990,
-        fibRatioLevel=1.0,
-        takeProfit=21070,
-        stopLoss=21070,
-        generatedAt=str(datetime.now()),
-        systemTimeStamp=str(datetime.now()),
-    )
-
-    send_notification(
-        get_redis_client(),
-        stream=settings.ORDERS_NOTIFICATIONS_STREAM,
-        event="PENDING_ORDER",
-        notification={
-            "metadata": pendingOrderGenerated.model_dump(),
-            "Instrument": settings.INSTRUMENT,
-            "AtmStrategy": f"4_10"
-        }
-    )
+    app()
+    # pendingOrderGenerated = PendingOrder(
+    #     instrument=settings.INSTRUMENT,
+    #     orderType="SELL",
+    #     price=5990,
+    #     fibRatioLevel=1.0,
+    #     takeProfit=21070,
+    #     stopLoss=21070,
+    #     generatedAt=str(datetime.now()),
+    #     systemTimeStamp=str(datetime.now()),
+    # )
+    #
+    # send_notification(
+    #     get_redis_client(),
+    #     stream=settings.ORDERS_NOTIFICATIONS_STREAM,
+    #     event="PENDING_ORDER",
+    #     notification={
+    #         "metadata": pendingOrderGenerated.model_dump(),
+    #         "Instrument": settings.INSTRUMENT,
+    #         "AtmStrategy": f"4_10"
+    #     }
+    # )
