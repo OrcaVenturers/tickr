@@ -37,6 +37,10 @@ def generate_hash_id(*fields: str) -> str:
     return hash_digest
 
 
+def round_to_nearest_quarter(value):
+    return round(value * 4) / 4
+
+
 def calculate_fib_levels(point_a, point_b):
     # Calculate the difference between Point A and Point B
     difference = point_a - point_b
@@ -50,8 +54,9 @@ def calculate_fib_levels(point_a, point_b):
         else:
             level = point_b - (difference * abs(ratio))
 
-        # Round the level to the nearest integer
-        fib_levels[ratio] = round(level)
+        # Round the level to the nearest 0.25 increment
+        fib_levels[ratio] = round_to_nearest_quarter(level)
+
     return fib_levels
 
 
