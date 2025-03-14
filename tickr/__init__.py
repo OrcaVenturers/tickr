@@ -6,4 +6,4 @@ load_dotenv()
 from loguru import logger as logging
 
 logging.remove(0)
-logging.add(sys.stderr, level="INFO")
+logging.add(sys.stderr, level="DEBUG")

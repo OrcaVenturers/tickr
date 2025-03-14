@@ -3,7 +3,8 @@ import os
 from pydantic import BaseModel
 from tabulate import tabulate
 
-class PendingOrder(BaseModel):
+class PendingOrderInventory(BaseModel):
+    orderId: str  # Unique identifier for the pending order
     instrument: str
     orderType: str
     price: float
