@@ -9,12 +9,8 @@ class Connections(BaseModel):
     REDIS_HOST: Optional[str] = "redis"
     REDIS_PORT: Optional[int] = 6379
     REDIS_PASSWORD: Optional[str] = None
-    LOGGING_LEVEL: Optional[str] = "INFO"
-    DISCORD_WEBHOOK_URL: Optional[str] = None
 
 class ConfigModel(BaseModel):
-    REDIS_PRICE_STREAM_CHANNEL: str
-    FIBONACCI_RATIOS: List[float]
     ALLOWED_TIMES: List[Tuple[time, time]]
     CONNECTIONS: Connections
 
@@ -23,7 +19,7 @@ class ConfigModel(BaseModel):
         return any(start <= priceTimestamp.time() <= end for start, end in self.ALLOWED_TIMES)
 
 
-CONFIG_FILE = os.getenv("CONFIG_FILE")
+CONFIG_FILE = os.getenv("CONFIG_FILE", "credentials.json")
 with open(CONFIG_FILE, "r") as f:
     config_data = json.load(f)
 

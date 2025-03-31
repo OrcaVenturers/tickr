@@ -23,6 +23,7 @@ secrets.toml
 # Project specific files
 *.env
 *.json
+!credentials.json
 .flaskenv*
 !.env.project
 !.env.vault

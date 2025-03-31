@@ -24,7 +24,9 @@ from tickr.strategies.RedisClient import get_redis_client
 from tabulate import tabulate
 from tickr.strategies.utils import timeit
 import typer
-
+from utilities.helper import (
+    generate_strategy,
+)
 
 app = typer.Typer()
 
@@ -32,10 +34,9 @@ app = typer.Typer()
 def round_to_nearest_quarter(value):
     return round(value * 4) / 4
 
-def calculate_fib_levels(point_a, point_b):
+def calculate_fib_levels(point_a, point_b, ratios):
     # Calculate the difference between Point A and Point B
     difference = point_a - point_b
-    ratios = settings.FIBONACCI_RATIOS
 
     # Calculate the levels for each ratio
     fib_levels = {}
@@ -74,11 +75,18 @@ class FibonacciTradingBot:
         stop_loss: int,
         reactivation_distance: float,
         nt_account: str,
+        price_stream_channel: str,
+        fibonacci_ratios: List[float],
+        logging_level: str = "INFO",
         is_backtest: bool = False,
         profit_threshold: float = None,
         loss_threshold: float = None,
         log_file: str = f"trades/logs.{datetime.now()}.csv"
     ):
+        # Set logging level
+        logger.remove()
+        logger.add(sys.stderr, level=logging_level)
+        
         # Initialize with provided points
         self.POINT_A = point_a
         self.POINT_B = point_b
@@ -88,16 +96,19 @@ class FibonacciTradingBot:
         self.SL = stop_loss
         self.REACTIVATION_DISTANCE = reactivation_distance
         self.NT_ACCOUNT = nt_account
+        self.PRICE_STREAM_CHANNEL = price_stream_channel
         self.is_backtest = is_backtest
         self.profit_threshold = profit_threshold
         self.loss_threshold = loss_threshold
+        self.threshold_reached = False  # New flag to track if threshold is reached
         
         if self.POINT_A is None or self.POINT_B is None:
             raise ValueError("Point A and Point B must be provided")
             
         self.fib_levels = calculate_fib_levels(
             point_a=self.POINT_A,
-            point_b=self.POINT_B
+            point_b=self.POINT_B,
+            ratios=fibonacci_ratios
         )
         self.isTradingZoneActive = False
         self.client: Optional[RedisCluster] = None
@@ -146,13 +157,15 @@ class FibonacciTradingBot:
             return None
             
         try:
-            action = ActionTypes.BUY.value if order_type == "LONG" else ActionTypes.SELL.value
+            action = order_type
+            atm_strategy_key = f"{self.TP}_{self.SL}"
+            atm_strategy = generate_strategy(atm_strategy_key, self.INSTRUMENT)
             order = Order(
                 instrument_name=self.INSTRUMENT,
                 action=action,
                 quantity=self.QUANTITY,
                 price=price,
-                strategy=f"{self.TP}_{self.SL}"
+                strategy=atm_strategy
             )
             
             # Only place actual NinjaTrader orders in production mode
@@ -163,7 +176,6 @@ class FibonacciTradingBot:
                 logger.info(f"{tick_timestamp}: [BACKTEST] Would place {order_type} order on NinjaTrader at price: {price}")
                 
             self.orders_placed_ninjatrader.append(order)
-            print(self.orders_placed_ninjatrader)
             return order
         except Exception as e:
             logger.error(f"Error placing NinjaTrader order: {e}")
@@ -188,7 +200,6 @@ class FibonacciTradingBot:
         """Enter a position when a pending order is hit"""
         self.active_levels[level] = False
         logger.warning(f"{tick_timestamp}: Deactivated ratio. {level} until (`price > {price + self.REACTIVATION_DISTANCE}` OR `price < {price - self.REACTIVATION_DISTANCE}`)")
-        print(self.active_levels)
 
         if self.isTradingZoneActive:
             logger.success(f"{tick_timestamp}: Entering {positionType} position at ratio:{level} - Price:{price}")
@@ -211,12 +222,9 @@ class FibonacciTradingBot:
                 stopLoss = positionStopLoss
             )
             self.open_positions.append(open_position)
-            print(self.open_positions)
             
             # Map the order to the position
-            self.order_to_position_map[order_id] = open_position
-            print(self.order_to_position_map)
-            # Remove the pending order that was hit
+            self.order_to_position_map[order_id] = open_position            # Remove the pending order that was hit
             self.internal_pending_orders_inventory = [order for order in self.internal_pending_orders_inventory if order.orderId != order_id]
         else:
             logger.debug(f"{tick_timestamp}: Position Entry void at level: {level} - Outside trading window zone")
@@ -249,10 +257,13 @@ class FibonacciTradingBot:
                 systemTimeStamp=str(datetime.now()),
             )
             self.internal_pending_orders_inventory.append(pendingOrderGenerated)
-            print(self.internal_pending_orders_inventory)
             logger.debug(f"{tick_timestamp}: Added to internal pending order inventory with ID: {order_id}")
 
     def process_price(self, current_price, tick_timestamp: datetime):
+        # If threshold was reached, stop processing
+        if self.threshold_reached:
+            return
+            
         # Update trading window status
         was_in_trading_window = self.isTradingZoneActive
         self.isTradingZoneActive = settings.isWithinAllowableTradingWindow(tick_timestamp)
@@ -263,10 +274,9 @@ class FibonacciTradingBot:
             self.cancel_all_orders()
         
         # If we just entered the trading window, place orders for active levels
-        if not was_in_trading_window and self.isTradingZoneActive:
+        if not was_in_trading_window and self.isTradingZoneActive and not self.threshold_reached:
             logger.info(f"{tick_timestamp}: Trading window started, placing orders for active levels")
             for fib_level, is_active in self.active_levels.items():
-                print(self.active_levels)
                 if is_active:
                     fib_level_price = self.fib_levels[fib_level]
                     pending_order_type = "SELL" if fib_level_price > current_price else "BUY"
@@ -318,10 +328,8 @@ class FibonacciTradingBot:
 
     def close_position(self, position, result, profit_loss, current_price, tick_timestamp):
         self.open_positions.remove(position)
-        print(self.open_positions)
         # Remove any associated orders from the map
         self.order_to_position_map = {k: v for k, v in self.order_to_position_map.items() if v != position}
-        print(self.order_to_position_map)
         
         closed_position = PositionClose(
             metadata=position,
@@ -332,25 +340,25 @@ class FibonacciTradingBot:
             net=profit_loss
         )
         self.closed_positions.append(closed_position)
-        print(self.closed_positions)
         # Update total P&L
         self.total_pnl += profit_loss
-        
-        # Check profit/loss thresholds
-        if (self.profit_threshold is not None and self.total_pnl >= self.profit_threshold) or \
-           (self.loss_threshold is not None and self.total_pnl <= self.loss_threshold):
-            logger.warning(f"{'Profit' if self.total_pnl >= 0 else 'Loss'} threshold reached ({self.total_pnl}). Stopping trading.")
-            self.cancel_all_orders()
-            if not self.is_backtest:
-                sys.exit(0)
-            return
-        
+
         # Print position close and current P&L status
         highlighted_message_color = "on_green" if closed_position.outcome == "PROFIT" else "on_red"
         cprint(f"{tick_timestamp}: Position closed/flatten at {current_price} - {result}: {profit_loss}", "black", highlighted_message_color)
         print(closed_position)
         self.print_pnl_summary()  # Print updated P&L summary after each position close
 
+        
+        # Check profit/loss thresholds
+        if (self.profit_threshold is not None and self.total_pnl >= self.profit_threshold) or (self.loss_threshold is not None and self.total_pnl <= self.loss_threshold):
+            logger.warning(f"{'Profit' if self.total_pnl >= 0 else 'Loss'} threshold reached ({self.total_pnl}). Stopping trading.")
+            self.threshold_reached = True  # Set the flag
+            self.cancel_all_orders()
+            if not self.is_backtest:
+                sys.exit(0)
+            return
+        
     def reactivate_levels(self, current_price, tick_timestamp):
         for fib_level, fib_level_price in self.fib_levels.items():
             if not self.active_levels[fib_level]:  # Only check inactive levels
@@ -358,14 +366,13 @@ class FibonacciTradingBot:
                     self.active_levels[fib_level] = True
                     logger.info(
                         f"{tick_timestamp}: Reactivated Fib. ratio: {fib_level} ({fib_level_price}) at - current price: {current_price}")
-                    print(self.active_levels)
                     pending_order_type = "SELL" if fib_level_price > current_price else "BUY"
                     self.generate_pending_orders(pending_order_type, fib_level, fib_level_price, tick_timestamp)
 
     def production(self):
         self.client = get_redis_client()
         pubsub = self.client.pubsub()
-        pubsub.subscribe(settings.REDIS_PRICE_STREAM_CHANNEL)
+        pubsub.subscribe(self.PRICE_STREAM_CHANNEL)
         running = True
         logger.debug("Listening for price stream...")
         try:
@@ -420,8 +427,18 @@ def production(
     config_file: str = typer.Option("configs/es.dev.json", help="Path to configuration file"),
     profit_threshold: float = typer.Option(None, help="Stop trading if total profit exceeds this value"),
     loss_threshold: float = typer.Option(None, help="Stop trading if total loss exceeds this value (provide as positive number)"),
+    price_stream_channel: str = typer.Option("NT8_ES_PRICESTREAM", help="Redis channel for price stream"),
+    fibonacci_ratios: str = typer.Option("[0,0.23,0.38,0.50,0.618,0.78,1.0,1.23,1.618,2.14,2.618,3.618,-0.23,-0.618,-1.14,-1.618,-2.14,-2.618,-3.618]", help="JSON array of Fibonacci ratios"),
+    logging_level: str = typer.Option("INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)"),
 ):
     """Run the Fibonacci trading bot in production mode"""
+    # Parse fibonacci ratios from JSON string
+    try:
+        fib_ratios = json.loads(fibonacci_ratios)
+    except json.JSONDecodeError:
+        typer.echo("Error: fibonacci_ratios must be a valid JSON array")
+        sys.exit(1)
+        
     bot = FibonacciTradingBot(
         point_a=point_a,
         point_b=point_b,
@@ -431,6 +448,9 @@ def production(
         stop_loss=stop_loss,
         reactivation_distance=reactivation_distance,
         nt_account=nt_account,
+        price_stream_channel=price_stream_channel,
+        fibonacci_ratios=fib_ratios,
+        logging_level=logging_level,
         is_backtest=False,
         profit_threshold=profit_threshold,
         loss_threshold=loss_threshold if loss_threshold is None else -abs(loss_threshold)
@@ -458,28 +478,46 @@ def backtest(
     config_file: str = typer.Option("configs/es.dev.json", help="Path to configuration file"),
     profit_threshold: float = typer.Option(None, help="Stop trading if total profit exceeds this value"),
     loss_threshold: float = typer.Option(None, help="Stop trading if total loss exceeds this value (provide as positive number)"),
+    price_stream_channel: str = typer.Option("NT8_ES_PRICESTREAM", help="Redis channel for price stream"),
+    fibonacci_ratios: str = typer.Option("[0,0.23,0.38,0.50,0.618,0.78,1.0,1.23,1.618,2.14,2.618,3.618,-0.23,-0.618,-1.14,-1.618,-2.14,-2.618,-3.618]", help="JSON array of Fibonacci ratios"),
+    logging_level: str = typer.Option("INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)"),
 ):
     """Run the Fibonacci trading bot in backtest mode"""
     if not filepath:
         typer.echo("No filepath defined? Please define using --filepath flag")
-    else:
-        typer.echo(f"\nRunning backtesting on dataset: {filepath}")
+        return
         
-        bot = FibonacciTradingBot(
-            point_a=point_a,
-            point_b=point_b,
-            instrument=instrument,
-            quantity=quantity,
-            take_profit=take_profit,
-            stop_loss=stop_loss,
-            reactivation_distance=reactivation_distance,
-            nt_account=nt_account,
-            is_backtest=True,
-            profit_threshold=profit_threshold,
-            loss_threshold=loss_threshold if loss_threshold is None else -abs(loss_threshold)
-        )
+    # Parse fibonacci ratios from JSON string
+    try:
+        fib_ratios = json.loads(fibonacci_ratios)
+    except json.JSONDecodeError:
+        typer.echo("Error: fibonacci_ratios must be a valid JSON array")
+        sys.exit(1)
         
-        bot.backtest(filepath)
+    typer.echo(f"\nRunning backtesting on dataset: {filepath}")
+    
+    bot = FibonacciTradingBot(
+        point_a=point_a,
+        point_b=point_b,
+        instrument=instrument,
+        quantity=quantity,
+        take_profit=take_profit,
+        stop_loss=stop_loss,
+        reactivation_distance=reactivation_distance,
+        nt_account=nt_account,
+        price_stream_channel=price_stream_channel,
+        fibonacci_ratios=fib_ratios,
+        logging_level=logging_level,
+        is_backtest=True,
+        profit_threshold=profit_threshold,
+        loss_threshold=loss_threshold if loss_threshold is None else -abs(loss_threshold)
+    )
+    # Add startup timer
+    print("\nStarting bot in 10 seconds...")
+    for _ in tqdm(range(10), desc="Startup", unit="s"):
+        time.sleep(1)
+    print(f"Backtesting on {filepath}")
+    bot.backtest(filepath)
 
 if __name__ == "__main__":
     app()
